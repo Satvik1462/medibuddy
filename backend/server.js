@@ -240,8 +240,7 @@ function incompleteBookingMessage(booking, language) {
 async function translateText(text, targetLanguage) {
   if (!text || !targetLanguage) return text;
   try {
-    const resp = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+    const resp = await generateWithFallback({
       contents: [{ role: "user", parts: [{ text }] }],
       config: {
         systemInstruction:
@@ -468,6 +467,48 @@ app.post("/citizen/login", async (req, res) => {
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
+
+// Models are tried in this order. If one returns a temporary error
+// (503 overloaded, 429 quota/rate limit, 500/502/504), the request is
+// retried once on the same model and then falls through to the next model.
+// Change the order/models from backend/.env without touching code:
+//   GEMINI_MODELS=gemini-3.5-flash,gemini-2.5-flash,gemini-3.1-flash-lite
+const GEMINI_MODELS = (
+  process.env.GEMINI_MODELS ||
+  "gemini-3.5-flash,gemini-2.5-flash,gemini-3.1-flash-lite"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const RETRYABLE_STATUSES = [429, 500, 502, 503, 504];
+
+function getErrorStatus(err) {
+  const direct = Number(err?.status || err?.code);
+  if (RETRYABLE_STATUSES.includes(direct)) return direct;
+  const fromMessage = String(err?.message || "").match(/\b(429|500|502|503|504)\b/);
+  return fromMessage ? Number(fromMessage[1]) : direct || null;
+}
+
+// Drop-in replacement for ai.models.generateContent() — pass the same
+// params but WITHOUT `model` (it is chosen here from GEMINI_MODELS).
+async function generateWithFallback(params) {
+  let lastErr;
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await ai.models.generateContent({ ...params, model });
+      } catch (err) {
+        lastErr = err;
+        const status = getErrorStatus(err);
+        if (!RETRYABLE_STATUSES.includes(status)) throw err; // not a temporary error
+        console.warn(`[gemini] ${model} failed (${status}), attempt ${attempt + 1}/2`);
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
 
 // =========================================================
 // HEALTH CHECK
@@ -1424,7 +1465,7 @@ app.post("/book", requireCitizen, async (req, res) => {
       `
       SELECT *
       FROM patients
-      WHERE RIGHT(regexp_replace(phone, '\D', '', 'g'), 10) = $1
+      WHERE RIGHT(regexp_replace(phone, '\\D', '', 'g'), 10) = $1
       `,
       [phone]
     );
@@ -2563,13 +2604,11 @@ EXACT FORMAT:
       };
     } else {
       // =====================================================
-      // GEMINI
+      // GEMINI  (auto retry + fallback across GEMINI_MODELS)
       // =====================================================
 
       const response =
-        await ai.models.generateContent({
-          model: "gemini-3.1-flash-lite",
-
+        await generateWithFallback({
           contents: conversation,
 
           config: {
@@ -2578,7 +2617,9 @@ EXACT FORMAT:
 
             temperature: 0.1,
 
-            maxOutputTokens: 1000,
+            // Newer Gemini models can spend part of this budget on
+            // internal "thinking", so keep it generous to avoid cut-off JSON.
+            maxOutputTokens: 2000,
 
             responseMimeType:
               "application/json",
