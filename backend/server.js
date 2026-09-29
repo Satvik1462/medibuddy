@@ -472,10 +472,10 @@ const ai = new GoogleGenAI({
 // (503 overloaded, 429 quota/rate limit, 500/502/504), the request is
 // retried once on the same model and then falls through to the next model.
 // Change the order/models from backend/.env without touching code:
-//   GEMINI_MODELS=gemini-3.5-flash,gemini-2.5-flash,gemini-3.1-flash-lite
+//   GEMINI_MODELS=gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite
 const GEMINI_MODELS = (
   process.env.GEMINI_MODELS ||
-  "gemini-3.5-flash,gemini-2.5-flash,gemini-3.1-flash-lite"
+  "gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite"
 )
   .split(",")
   .map((s) => s.trim())
@@ -501,6 +501,12 @@ async function generateWithFallback(params) {
       } catch (err) {
         lastErr = err;
         const status = getErrorStatus(err);
+        // 404 = this model name doesn't exist / is retired for this key.
+        // Retrying is pointless, so skip straight to the next model.
+        if (status === 404) {
+          console.warn(`[gemini] ${model} not available (404), skipping to next model`);
+          break;
+        }
         if (!RETRYABLE_STATUSES.includes(status)) throw err; // not a temporary error
         console.warn(`[gemini] ${model} failed (${status}), attempt ${attempt + 1}/2`);
         await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
