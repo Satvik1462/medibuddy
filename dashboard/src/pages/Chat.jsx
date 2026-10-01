@@ -37,6 +37,33 @@ function findSelectedSlot(booking, availableSlots) {
   return availableSlots.find((slot) => Number(slot.id) === Number(booking.slot_id)) || null;
 }
 
+// All patient-side API calls go through here so an expired/invalid citizen
+// session sends the patient back to the OTP login instead of showing a
+// misleading "server se connection nahi ho pa raha" error.
+class CitizenSessionError extends Error {}
+
+async function citizenFetch(path, { method = "GET", body } = {}) {
+  const response = await fetch(`${API_URL}${path}`, {
+    method,
+    headers: {
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      Authorization: `Bearer ${localStorage.getItem("citizen_token") || ""}`,
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401 || (response.status === 403 && /citizen/i.test(data.error || ""))) {
+    citizenLogout();
+    throw new CitizenSessionError(data.error || "Session expired, please log in again");
+  }
+  if (!response.ok) {
+    const err = new Error(data.error || `Request failed (${response.status})`);
+    err.status = response.status;
+    throw err;
+  }
+  return data;
+}
+
 const WELCOME = {
   role: "assistant",
   message:
@@ -83,27 +110,28 @@ export default function App() {
   const navigate = useNavigate();
   const citizen = getCitizen();
 
-  useEffect(() => {
-    let cancelled = false;
-    async function loadHistory() {
-      if (!citizen?.phone) return;
-      try {
-        const response = await fetch(`${API_URL}/patients/history?phone=${encodeURIComponent(citizen.phone)}`, {
-          headers: {
-            Authorization: `Bearer ${localStorage.getItem("citizen_token") || ""}`,
-          },
-        });
-        const data = await response.json();
-        if (!cancelled && response.ok) {
-          setReturningPatient(data.patient || null);
-          setPatientHistory(Array.isArray(data.history) ? data.history : []);
-        }
-      } catch (error) {
-        console.error("History load error:", error);
-      }
+  function handleSessionError(error) {
+    if (error instanceof CitizenSessionError) {
+      navigate("/citizen-login", { replace: true });
+      return true;
     }
+    return false;
+  }
+
+  async function loadHistory() {
+    if (!citizen?.phone) return;
+    try {
+      const data = await citizenFetch(`/patients/history?phone=${encodeURIComponent(citizen.phone)}`);
+      setReturningPatient(data.patient || null);
+      setPatientHistory(Array.isArray(data.history) ? data.history : []);
+    } catch (error) {
+      if (!handleSessionError(error)) console.error("History load error:", error);
+    }
+  }
+
+  useEffect(() => {
     loadHistory();
-    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [citizen?.phone]);
 
   useEffect(() => {
@@ -148,10 +176,9 @@ export default function App() {
     setLoading(true);
 
     try {
-      const response = await fetch(`${API_URL}/ai/chat`, {
+      const data = await citizenFetch("/ai/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("citizen_token") || ""}` },
-        body: JSON.stringify({
+        body: {
           message: text,
           history: messages,
           booking: requestBooking,
@@ -163,11 +190,8 @@ export default function App() {
           // booking — the backend re-checks name + mobile number here and
           // will only ever create the appointment via this field.
           confirm_details: confirmDetails,
-        }),
+        },
       });
-
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "AI assistant failed");
 
       if (Array.isArray(data.doctors) && data.doctors.length > 0) {
         // Merge, never overwrite-to-empty. Once a doctor has been selected,
@@ -216,6 +240,15 @@ export default function App() {
         message: reply || (data.booked ? "Appointment confirmed successfully." : "Sorry, mujhe response nahi mila."),
       }];
       if (data.booked && data.appointment) {
+        // Keep the header profile + history panel in sync with what was
+        // just booked (they used to show the old name / old visit list).
+        try {
+          const info = JSON.parse(localStorage.getItem("citizen_info") || "{}");
+          if (data.booking?.patient_name) {
+            localStorage.setItem("citizen_info", JSON.stringify({ ...info, name: data.booking.patient_name }));
+          }
+        } catch { /* cosmetic only */ }
+        loadHistory();
         nextMessages.push({
           role: "assistant",
           message: "Appointment booking completed. Dhanyavaad!",
@@ -224,13 +257,18 @@ export default function App() {
       }
       setMessages(nextMessages);
     } catch (error) {
+      if (handleSessionError(error)) return;
       console.error("AI chat error:", error);
+      // A 4xx from the server carries a real, readable reason (e.g. the
+      // confirm card's mobile number check) — show it instead of pretending
+      // the server is unreachable.
+      const message = error?.status && error.status < 500
+        ? error.message
+        : "Sorry, abhi server se connection nahi ho pa raha. Please thodi der baad try karein.";
+      if (confirmDetails) setConfirmError(message);
       setMessages([
         ...updatedMessages,
-        {
-          role: "assistant",
-          message: "Sorry, abhi server se connection nahi ho pa raha. Please thodi der baad try karein.",
-        },
+        { role: "assistant", message },
       ]);
     } finally {
       setLoading(false);
@@ -241,22 +279,27 @@ export default function App() {
     setFeedbackSubmitting(true);
     setFeedbackError("");
     try {
-      const response = await fetch(`${API_URL}/feedback`, {
+      // BUG FIX: this request had NO Authorization header, and /feedback
+      // requires a citizen login — so every feedback submission failed with
+      // 401. (There was also no button anywhere to open this form.)
+      await citizenFetch("/feedback", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           appointment_id: appointmentId,
           rating: feedbackRating,
           comment: feedbackComment.trim() || null,
-        }),
+        },
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Feedback save nahi hua");
+      const savedRating = feedbackRating;
+      setPatientHistory((prev) => prev.map((h) => (
+        h.appointment_id === appointmentId ? { ...h, feedback_rating: savedRating } : h
+      )));
       setFeedbackDoneIds((prev) => new Set(prev).add(appointmentId));
       setFeedbackOpenFor(null);
       setFeedbackComment("");
       setFeedbackRating(5);
     } catch (err) {
+      if (handleSessionError(err)) return;
       setFeedbackError(err.message || "Feedback save nahi hua");
     } finally {
       setFeedbackSubmitting(false);
@@ -327,6 +370,18 @@ export default function App() {
     }
   }, [showConfirmCard, confirmPrefilled, patientName, patientPhone, citizen?.phone]);
 
+  // BUG FIX: the confirm-details popup is a full-screen overlay with no way
+  // out — once a slot was picked the patient could not change the time or
+  // doctor, or even type in the chat, except by starting a brand-new chat.
+  function cancelConfirmDetails() {
+    setBooking((prev) => ({ ...prev, slot_id: null, pending_slot_id: null, confirmed: false }));
+    setConfirmError("");
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", message: "Theek hai. Aap kis time aa sakte hain? Ya kisi aur doctor se milna ho to bata dijiye." },
+    ]);
+  }
+
   async function submitConfirmDetails() {
     const name = confirmName.trim();
     const phoneDigits = confirmPhone.replace(/\D/g, "").slice(-10);
@@ -336,6 +391,10 @@ export default function App() {
     }
     if (phoneDigits.length !== 10) {
       setConfirmError("Please enter a valid 10-digit mobile number.");
+      return;
+    }
+    if (citizen?.phone && phoneDigits !== String(citizen.phone).slice(-10)) {
+      setConfirmError("Mobile number wahi hona chahiye jisse aapne OTP se login kiya hai.");
       return;
     }
     setConfirmError("");
@@ -435,6 +494,53 @@ export default function App() {
                       <div className="history-popover-meta">
                         {item.date ? formatDate(item.date) : "—"}{item.time ? ` · ${formatTime(item.time)}` : ""} · {item.status || ""}
                       </div>
+                      {item.status === "attended" && (
+                        item.feedback_rating || feedbackDoneIds.has(item.appointment_id) ? (
+                          <div className="history-popover-meta">
+                            {"★".repeat(Number(item.feedback_rating) || 0)} Feedback diya — dhanyavaad!
+                          </div>
+                        ) : feedbackOpenFor === item.appointment_id ? (
+                          <div className="feedback-inline" style={{ marginTop: 6 }}>
+                            <div style={{ display: "flex", gap: 4 }}>
+                              {[1, 2, 3, 4, 5].map((n) => (
+                                <button
+                                  key={n}
+                                  type="button"
+                                  aria-label={`${n} star`}
+                                  onClick={() => setFeedbackRating(n)}
+                                  style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: n <= feedbackRating ? "#f5a623" : "#c8c8c8", padding: 0 }}
+                                >
+                                  ★
+                                </button>
+                              ))}
+                            </div>
+                            <textarea
+                              rows={2}
+                              value={feedbackComment}
+                              onChange={(e) => setFeedbackComment(e.target.value)}
+                              placeholder="Apna anubhav likhiye (optional)"
+                              style={{ width: "100%", marginTop: 4, boxSizing: "border-box" }}
+                              maxLength={500}
+                            />
+                            {feedbackError && <div className="confirm-card-error">{feedbackError}</div>}
+                            <div className="row-actions" style={{ marginTop: 4 }}>
+                              <button type="button" className="btn-mini btn-good" disabled={feedbackSubmitting} onClick={() => submitFeedback(item.appointment_id)}>
+                                {feedbackSubmitting ? "Saving…" : "Submit"}
+                              </button>
+                              <button type="button" className="btn-mini" onClick={() => { setFeedbackOpenFor(null); setFeedbackError(""); }}>Cancel</button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-mini"
+                            style={{ marginTop: 6 }}
+                            onClick={() => { setFeedbackOpenFor(item.appointment_id); setFeedbackRating(5); setFeedbackComment(""); setFeedbackError(""); }}
+                          >
+                            ★ Feedback dein
+                          </button>
+                        )
+                      )}
                     </div>
                   ))}
                 </div>
@@ -517,6 +623,16 @@ export default function App() {
             </div>
           )}
 
+
+          {/* PROPOSED SLOT — one-tap Yes / No */}
+          {booking?.pending_slot_id && !booking?.slot_id && !appointment && !loading && !chatCompleted && (
+            <div className="quick-actions">
+              <div className="row-actions">
+                <button type="button" className="btn-mini btn-good" onClick={() => dispatchMessage("Haan", { quickAction: true })}>Haan, aa jaunga</button>
+                <button type="button" className="btn-mini btn-bad" onClick={() => dispatchMessage("Nahi", { quickAction: true })}>Nahi, doosra time</button>
+              </div>
+            </div>
+          )}
 
           {/* APPOINTMENT CONFIRMED TICKET */}
           {appointment?.appointment && (
@@ -622,15 +738,28 @@ export default function App() {
                   onChange={(event) => setConfirmPhone(event.target.value.replace(/\D/g, "").slice(-10))}
                   placeholder="10-digit mobile number"
                   maxLength={10}
+                  // Verified by OTP at login — the booking is always made on this number.
+                  readOnly={Boolean(citizen?.phone)}
+                  title={citizen?.phone ? "Verified at login" : undefined}
                   disabled={loading || confirmSubmitting}
                 />
               </label>
               {confirmError && <p className="confirm-card-error">{confirmError}</p>}
             </div>
-            <div className="confirm-card-actions">
+            <div className="confirm-card-actions" style={{ display: "flex", gap: 10 }}>
+              <button
+                type="button"
+                className="btn-mini"
+                style={{ flex: 1 }}
+                onClick={cancelConfirmDetails}
+                disabled={loading || confirmSubmitting}
+              >
+                Change time / doctor
+              </button>
               <button
                 type="button"
                 className="btn-primary"
+                style={{ flex: 2 }}
                 onClick={submitConfirmDetails}
                 disabled={loading || confirmSubmitting}
               >

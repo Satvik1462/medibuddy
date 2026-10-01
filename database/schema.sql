@@ -112,20 +112,27 @@ CREATE TABLE IF NOT EXISTS feedback (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- ============================================================
--- MIGRATION (run this if you already have a live `feedback` table
--- WITHOUT a unique constraint on appointment_id — needed so one
--- appointment can't accidentally get two feedback rows, e.g. if a
--- patient double-submits or resubmits after a page refresh):
---
---   ALTER TABLE feedback ADD CONSTRAINT feedback_appointment_id_key UNIQUE (appointment_id);
---
--- If that fails because duplicates already exist, first keep only
--- the newest row per appointment_id:
---   DELETE FROM feedback f USING feedback f2
---   WHERE f.appointment_id = f2.appointment_id AND f.id < f2.id;
--- then re-run the ALTER TABLE above.
--- ============================================================
+-- BUG FIX: an older `feedback` table (created before appointment_id was
+-- UNIQUE) makes POST /feedback crash with "there is no unique or exclusion
+-- constraint matching the ON CONFLICT specification". That migration used to
+-- live in a comment only; the backend runs this file on every start, so do it
+-- here automatically: keep the newest row per appointment, then add the key.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+    WHERE i.indrelid = 'feedback'::regclass
+      AND i.indisunique
+      AND i.indnatts = 1
+      AND a.attname = 'appointment_id'
+  ) THEN
+    DELETE FROM feedback f USING feedback f2
+    WHERE f.appointment_id = f2.appointment_id AND f.id < f2.id;
+    ALTER TABLE feedback ADD CONSTRAINT feedback_appointment_id_key UNIQUE (appointment_id);
+  END IF;
+END $$;
 
 -- Demo/admin account. Password: admin123
 INSERT INTO staff (username, password_hash, name, role)
@@ -160,9 +167,11 @@ FROM (VALUES
   ('Dr. Vivek Saxena', 'Neurologist', 'MBBS, MD, DM (Neurology)'),
   ('Dr. Nitin Bhatia', 'Gastroenterologist', 'MBBS, MD, DM (Gastroenterology)')
 ) AS v(name, specialization, qualification)
-WHERE NOT EXISTS (
-  SELECT 1 FROM doctors d WHERE d.name = v.name
-);
+-- BUG FIX: this used to re-insert any demo doctor whose name was missing —
+-- so if admin RENAMED "Dr. Anil Sharma", a server restart silently created a
+-- second, brand-new "Dr. Anil Sharma" (with slots and a login). Demo doctors
+-- are now only seeded into an empty database.
+WHERE NOT EXISTS (SELECT 1 FROM doctors);
 
 -- Backfill qualification for any pre-existing demo rows created before this column existed.
 UPDATE doctors SET qualification = 'MBBS, MD' WHERE name = 'Dr. Anil Sharma' AND qualification IS NULL;
@@ -190,13 +199,32 @@ FROM doctors d
 WHERE d.deleted_at IS NULL
   AND NOT EXISTS (
     SELECT 1 FROM staff s WHERE s.doctor_id = d.id AND s.role = 'doctor'
-  );
+  )
+-- BUG FIX: without this, a username clash (admin already used "dr5" for
+-- someone else) aborted the whole schema and the backend refused to start.
+ON CONFLICT (username) DO NOTHING;
 
 -- Sample recurring-looking slots for the next 14 days.
 -- Different doctors intentionally have different clinic hours.
+--
+-- BUG FIX: this ran on EVERY backend start for EVERY doctor, so:
+--   * a slot the admin had deliberately removed came back after a restart,
+--   * inactive doctors and admin-created doctors got demo slots they never set,
+--   * "today" was the UTC date, not the Indian date.
+-- Now it only fills the calendar of an ACTIVE doctor who has no upcoming
+-- slots at all (i.e. a fresh demo install, or a demo that has run out).
 INSERT INTO slots (doctor_id, date, time, status)
-SELECT d.id, (CURRENT_DATE + gs.day_offset)::date, t::time, 'available'
-FROM (SELECT * FROM doctors WHERE deleted_at IS NULL) d
+SELECT d.id, ((NOW() AT TIME ZONE 'Asia/Kolkata')::date + gs.day_offset)::date, t::time, 'available'
+FROM (
+  SELECT * FROM doctors dd
+  WHERE dd.deleted_at IS NULL
+    AND dd.active = true
+    AND NOT EXISTS (
+      SELECT 1 FROM slots s2
+      WHERE s2.doctor_id = dd.id
+        AND s2.date >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+    )
+) d
 CROSS JOIN generate_series(0, 13) AS gs(day_offset)
 CROSS JOIN LATERAL (
   SELECT unnest(
@@ -210,7 +238,4 @@ CROSS JOIN LATERAL (
     END
   ) AS t
 ) x
-WHERE NOT EXISTS (
-  SELECT 1 FROM slots s
-  WHERE s.doctor_id=d.id AND s.date=(CURRENT_DATE + gs.day_offset)::date AND s.time=t::time
-);
+ON CONFLICT (doctor_id, date, time) DO NOTHING;

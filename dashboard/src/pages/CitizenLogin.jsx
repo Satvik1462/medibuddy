@@ -25,7 +25,7 @@ export default function CitizenLogin() {
   return <div className="login-screen">
     <form className="login-card" onSubmit={step === 1 ? sendOtp : verify}>
       <Link to="/" className="login-home-link">← Back to Home</Link>
-      <div className="brand-orb small"><svg viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 21s-7.5-4.6-10-9.3C.3 7.4 2.4 3.5 6.3 3.1c2-.2 3.9.8 4.3 8.6C19.5 16.4 12 21 12 21Z" /></svg></div>
+      <div className="brand-orb small"><svg viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 21s-7.5-4.6-10-9.3C.3 7.4 2.4 3.5 6.3 3.1c2-.2 3.9.8 5.7 2.6 1.8-1.8 3.7-2.8 5.7-2.6 3.9.4 6 4.3 4.3 8.6C19.5 16.4 12 21 12 21Z" /></svg></div>
       <h1>Citizen Login</h1>
       <p className="login-subtitle">Login with your registered mobile number to book an appointment.</p>
       {error && <div className="banner banner-error">{error}</div>}

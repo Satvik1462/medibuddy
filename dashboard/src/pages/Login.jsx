@@ -18,7 +18,15 @@ export default function Login() {
     try {
       const staff = await login(username.trim(), password);
       const from = location.state?.from;
-      if (from && ((staff.role === "admin" && ["/admin", "/reception", "/doctor-schedule"].includes(from)) || (staff.role === "reception" && ["/reception", "/doctor-schedule"].includes(from)) || (staff.role === "doctor" && from === "/doctor"))) {
+      // BUG FIX: /appointments, /patients and /manual-entry were missing from
+      // these lists, so after a session expired on those pages the user was
+      // always dumped back on the dashboard instead of where they were.
+      const ALLOWED_BY_ROLE = {
+        admin: ["/admin", "/reception", "/doctor-schedule", "/appointments", "/patients", "/manual-entry"],
+        reception: ["/reception", "/doctor-schedule", "/appointments", "/patients", "/manual-entry"],
+        doctor: ["/doctor", "/appointments", "/patients"],
+      };
+      if (from && (ALLOWED_BY_ROLE[staff.role] || []).includes(from)) {
         navigate(from, { replace: true });
         return;
       }

@@ -7,7 +7,7 @@ const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const pool = require("./db");
-const { sendWhatsAppMessage } = require("./whatsapp");
+const { sendWhatsAppMessage, isConfigured: isWhatsAppConfigured } = require("./whatsapp");
 const { GoogleGenAI } = require("@google/genai");
 
 const app = express();
@@ -16,7 +16,53 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+
+// BUG FIX: the old fallback was a fixed, public string ("dev-secret-change-me").
+// If JWT_SECRET was ever missing from .env, anyone who read this code could
+// forge an ADMIN token and read every patient's data. Now a missing secret
+// falls back to a random per-process value (sessions just reset on restart)
+// and we warn loudly so it gets configured.
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET === "dev-secret-change-me") {
+  JWT_SECRET = require("crypto").randomBytes(48).toString("hex");
+  console.warn(
+    "[security] JWT_SECRET is not set in backend/.env — using a random secret for this run. " +
+    "All logins will be reset whenever the server restarts. Set a long random JWT_SECRET for production."
+  );
+}
+
+// All clinic dates/times are Indian wall-clock time. The database server
+// (Neon) runs in UTC, so CURRENT_DATE / NOW() alone are wrong between
+// 00:00 and 05:30 IST. Use these SQL snippets everywhere instead.
+const SQL_TODAY_IST = `(NOW() AT TIME ZONE 'Asia/Kolkata')::date`;
+const SQL_NOW_IST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`;
+
+function isoDateOnly(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) ? String(value) : null;
+}
+
+// BUG FIX: the three booking flows each built the WhatsApp confirmation by
+// hand as [doctor, date, patient, "14:30:00"] — 4 variables in a different
+// order than the README's approved template ({{1}} patient, {{2}} date,
+// {{3}} time), so Meta/Interakt rejected every send. One helper, one
+// documented order (same order as the reminder template), human-readable time.
+//   appointment_confirmation: {{1}} patient name, {{2}} doctor name, {{3}} date, {{4}} time
+function sendBookingConfirmation({ phone, patientName, doctorName, date, time }) {
+  return sendWhatsAppMessage(phone, "appointment_confirmation", [
+    patientName,
+    doctorName,
+    formatHumanDate(date),
+    formatChatTime(time),
+  ]).catch((e) => console.error("WhatsApp confirmation failed:", e));
+}
+
+function formatHumanDate(value) {
+  const iso = isoDateOnly(String(value || "").slice(0, 10));
+  if (!iso) return String(value || "");
+  const [y, m, d] = iso.split("-").map(Number);
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${d} ${months[m - 1]} ${y}`;
+}
 
 function normalizePhone(value) {
   const digits = String(value || "").replace(/\D/g, "");
@@ -297,7 +343,7 @@ const DEACTIVATED_MESSAGE = "This account has been deactivated. Please contact t
 async function isStaffAccountActive(payload) {
   if (!payload || !["reception", "doctor"].includes(payload.role)) return true;
   const r = await pool.query(
-    `SELECT s.active, d.deleted_at
+    `SELECT s.active, d.deleted_at, d.active AS doctor_active
      FROM staff s
      LEFT JOIN doctors d ON d.id = s.doctor_id
      WHERE s.id = $1`,
@@ -306,7 +352,13 @@ async function isStaffAccountActive(payload) {
   const row = r.rows[0];
   // A deleted (archived) doctor's login stops working immediately, without
   // waiting for their 12h token to expire.
-  return Boolean(row) && row.active !== false && !row.deleted_at;
+  // A deactivated doctor (doctors.active = false) must not keep working either.
+  return (
+    Boolean(row) &&
+    row.active !== false &&
+    !row.deleted_at &&
+    row.doctor_active !== false
+  );
 }
 
 function requireAuth(allowedRoles) {
@@ -323,6 +375,11 @@ function requireAuth(allowedRoles) {
       payload = jwt.verify(token, JWT_SECRET);
     } catch (err) {
       return res.status(401).json({ error: "Session expired, please log in again" });
+    }
+
+    // A citizen (patient) token must never pass a staff check.
+    if (payload.type === "citizen" || !["admin", "reception", "doctor"].includes(payload.role)) {
+      return res.status(403).json({ error: "Staff login required" });
     }
 
     if (allowedRoles && !allowedRoles.includes(payload.role)) {
@@ -366,6 +423,19 @@ app.post("/auth/login", async (req, res) => {
 
     if (user.active === false) {
       return res.status(403).json({ error: DEACTIVATED_MESSAGE });
+    }
+
+    // A doctor whose profile is deactivated or deleted cannot log in, even if
+    // their staff row still says active.
+    if (user.role === "doctor" && user.doctor_id) {
+      const docState = await pool.query(
+        `SELECT active, deleted_at FROM doctors WHERE id = $1`,
+        [user.doctor_id]
+      );
+      const d = docState.rows[0];
+      if (!d || d.active === false || d.deleted_at) {
+        return res.status(403).json({ error: DEACTIVATED_MESSAGE });
+      }
     }
 
     // For a doctor login, pull specialization/qualification/photo from the
@@ -472,10 +542,10 @@ const ai = new GoogleGenAI({
 // (503 overloaded, 429 quota/rate limit, 500/502/504), the request is
 // retried once on the same model and then falls through to the next model.
 // Change the order/models from backend/.env without touching code:
-//   GEMINI_MODELS=gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite
+//   GEMINI_MODELS=gemini-3.1-flash-lite
 const GEMINI_MODELS = (
   process.env.GEMINI_MODELS ||
-  "gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite"
+  "gemini-3.1-flash-lite"
 )
   .split(",")
   .map((s) => s.trim())
@@ -540,10 +610,15 @@ app.get("/doctors", async (req, res, next) => {
   next();
 }, async (req, res) => {
   const { all } = req.query;
+  // BUG FIX: this used to return every doctor's login username AND plain-text
+  // password to reception (all=true) — and the public list leaked usernames.
+  // Only admin gets login details now.
+  const isAdmin = req.staff?.role === "admin";
 
   try {
     const result = await pool.query(`
-      SELECT d.*, s.username AS login_username, s.password_display AS login_password
+      SELECT d.id, d.name, d.specialization, d.qualification, d.photo_url, d.active
+      ${isAdmin ? ", s.username AS login_username, s.password_display AS login_password" : ""}
       FROM doctors d
       LEFT JOIN staff s ON s.doctor_id = d.id AND s.role = 'doctor'
       WHERE d.deleted_at IS NULL
@@ -631,13 +706,31 @@ app.post("/doctors", requireAuth(["admin"]), async (req, res) => {
 // =========================================================
 
 app.put("/doctors/:id", requireAuth(["admin"]), async (req, res) => {
-  const { id } = req.params;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: "Invalid doctor id" });
+  }
   const { name, specialization, active, username, password } = req.body;
 
+  // BUG FIX: password length was not validated on edit (only on create), and
+  // the doctor row + login row were updated in two separate, non-transactional
+  // steps — a failure in the second step (e.g. duplicate username) left the
+  // doctor half-updated. Validate first, then update both in one transaction.
+  const newPassword = password === undefined || password === null ? "" : String(password);
+  if (newPassword && newPassword.length < 6) {
+    return res.status(400).json({ error: "password must be at least 6 characters" });
+  }
+  if (name !== undefined && !String(name).trim()) {
+    return res.status(400).json({ error: "name cannot be empty" });
+  }
+
+  const client = await pool.connect();
   try {
-    const existing = await pool.query(`SELECT * FROM doctors WHERE id = $1`, [id]);
+    await client.query("BEGIN");
+    const existing = await client.query(`SELECT * FROM doctors WHERE id = $1 FOR UPDATE`, [id]);
 
     if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "Doctor not found" });
     }
 
@@ -645,12 +738,41 @@ app.put("/doctors/:id", requireAuth(["admin"]), async (req, res) => {
 
     // An archived (deleted) doctor is read-only — restore them first.
     if (current.deleted_at) {
+      await client.query("ROLLBACK");
       return res.status(409).json({
         error: "This doctor is in Deleted Doctors. Restore them before editing.",
       });
     }
 
-    const result = await pool.query(
+    const staffResult = await client.query(
+      `SELECT id, username, password_display FROM staff WHERE doctor_id = $1 AND role = 'doctor' LIMIT 1`,
+      [id]
+    );
+    const staff = staffResult.rows[0];
+
+    if (!staff) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: "Doctor login account not found" });
+    }
+
+    const nextUsername = String(username ?? staff.username).trim();
+    if (nextUsername.length < 3) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "username must be at least 3 characters" });
+    }
+
+    if (nextUsername !== staff.username) {
+      const duplicate = await client.query(
+        `SELECT id FROM staff WHERE username = $1 AND id <> $2`,
+        [nextUsername, staff.id]
+      );
+      if (duplicate.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "Username is already in use" });
+      }
+    }
+
+    const result = await client.query(
       `
       UPDATE doctors
       SET name = $1, specialization = $2, active = $3
@@ -658,49 +780,37 @@ app.put("/doctors/:id", requireAuth(["admin"]), async (req, res) => {
       RETURNING *
       `,
       [
-        name ?? current.name,
+        name !== undefined ? String(name).trim() : current.name,
         specialization ?? current.specialization,
         typeof active === "boolean" ? active : current.active,
         id,
       ]
     );
 
-    const staffResult = await pool.query(
-      `SELECT id, username, password_display FROM staff WHERE doctor_id = $1 AND role = 'doctor' LIMIT 1`,
-      [id]
+    // Keep the doctor's login in sync with Activate / Deactivate.
+    await client.query(
+      `UPDATE staff SET active = $1 WHERE id = $2`,
+      [result.rows[0].active !== false, staff.id]
     );
-    const staff = staffResult.rows[0];
 
-    if (!staff) {
-      return res.status(500).json({ error: "Doctor login account not found" });
-    }
-
-    const nextUsername = String(username ?? staff.username).trim();
-    if (nextUsername.length < 3) {
-      return res.status(400).json({ error: "username must be at least 3 characters" });
-    }
-
-    if (nextUsername !== staff.username) {
-      const duplicate = await pool.query(
-        `SELECT id FROM staff WHERE username = $1 AND id <> $2`,
-        [nextUsername, staff.id]
-      );
-      if (duplicate.rows.length) {
-        return res.status(409).json({ error: "Username is already in use" });
-      }
-    }
-
-    await pool.query(
-      `UPDATE staff SET username = $1, name = $2${password ? ", password_hash = $3, password_display = $4" : ""} WHERE id = $${password ? 5 : 3}`,
-      password
-        ? [nextUsername, result.rows[0].name, await bcrypt.hash(String(password), 10), String(password), staff.id]
+    await client.query(
+      `UPDATE staff SET username = $1, name = $2${newPassword ? ", password_hash = $3, password_display = $4" : ""} WHERE id = $${newPassword ? 5 : 3}`,
+      newPassword
+        ? [nextUsername, result.rows[0].name, await bcrypt.hash(newPassword, 10), newPassword, staff.id]
         : [nextUsername, result.rows[0].name, staff.id]
     );
 
-    res.json({ success: true, doctor: { ...result.rows[0], login_username: nextUsername, login_password: password ? String(password) : staff.password_display } });
+    await client.query("COMMIT");
+    res.json({ success: true, doctor: { ...result.rows[0], login_username: nextUsername, login_password: newPassword || staff.password_display } });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("Update doctor error:", err);
+    if (err && err.code === "23505") {
+      return res.status(409).json({ error: "Username is already in use" });
+    }
     res.status(500).json({ error: "Failed to update doctor" });
+  } finally {
+    client.release();
   }
 });
 
@@ -933,8 +1043,8 @@ app.post("/doctors/:id/restore", requireAuth(["admin"]), async (req, res) => {
     // Their login row was kept on delete — just switch it back on. If it was
     // removed by an older hard-delete, recreate a default one.
     const staffRow = await client.query(
-      `UPDATE staff SET active = true WHERE doctor_id = $1 AND role = 'doctor' RETURNING id`,
-      [id]
+      `UPDATE staff SET active = $2 WHERE doctor_id = $1 AND role = 'doctor' RETURNING id`,
+      [id, activate]
     );
     if (!staffRow.rows.length) {
       await client.query(
@@ -1124,7 +1234,22 @@ app.post("/slots", requireAuth(["admin"]), async (req, res) => {
     return res.status(400).json({ error: "doctor_id, date and time(s) are required" });
   }
 
+  // BUG FIX: bad input (e.g. "25:00", "abc", a deleted doctor) used to either
+  // crash with a 500 or silently add slots to an archived doctor.
+  if (!isoDateOnly(date)) {
+    return res.status(400).json({ error: "date must be in YYYY-MM-DD format" });
+  }
+  const badTime = timeList.find((t) => !/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(String(t)));
+  if (badTime !== undefined) {
+    return res.status(400).json({ error: `Invalid time: ${badTime}` });
+  }
+
   try {
+    const doc = await pool.query(`SELECT id FROM doctors WHERE id = $1 AND deleted_at IS NULL`, [Number(doctor_id)]);
+    if (!doc.rows.length) {
+      return res.status(404).json({ error: "Doctor not found (or deleted)" });
+    }
+
     const inserted = [];
 
     for (const t of timeList) {
@@ -1404,11 +1529,11 @@ app.get("/patients/history", async (req, res) => {
 
 app.post("/book", requireCitizen, async (req, res) => {
   const {
-    patient_name,
     doctor_id,
     slot_id,
     chat_summary,
   } = req.body;
+  const patient_name = String(req.body.patient_name || "").trim().slice(0, 100);
   const phone = req.citizen.phone;
 
   // Keep the legacy/direct booking endpoint consistent with AI booking:
@@ -1541,22 +1666,12 @@ app.post("/book", requireCitizen, async (req, res) => {
 
     const slot = slotCheck.rows[0];
 
-    // WhatsApp confirmation — Dr name, date, patient name, time (in that
-    // order, matching the confirmation template's variable slots).
-    sendWhatsAppMessage(
+    sendBookingConfirmation({
       phone,
-      "appointment_confirmation",
-      [
-        slot.doctor_name,
-        String(slot.date),
-        patient_name,
-        String(slot.time),
-      ]
-    ).catch((e) => {
-      console.error(
-        "WhatsApp confirmation failed:",
-        e
-      );
+      patientName: patient_name,
+      doctorName: slot.doctor_name,
+      date: slot.date,
+      time: slot.time,
     });
 
     res.json({
@@ -1577,7 +1692,7 @@ app.post("/book", requireCitizen, async (req, res) => {
       },
     });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(() => {});
 
     console.error("Booking error:", err);
 
@@ -1626,15 +1741,20 @@ app.get("/appointments", requireAuth(["doctor", "reception", "admin"]), async (r
     const params = [];
     const where = [];
 
+    // BUG FIX: CURRENT_DATE is the DB server's date (UTC on Neon). Between
+    // 00:00 and 05:30 IST "today" pointed at yesterday. Use IST explicitly.
     if (date) {
+      if (!isoDateOnly(date)) {
+        return res.status(400).json({ error: "date must be in YYYY-MM-DD format" });
+      }
       params.push(date);
       where.push(`s.date = $${params.length}`);
     } else if (range === "today") {
-      where.push(`s.date = CURRENT_DATE`);
+      where.push(`s.date = ${SQL_TODAY_IST}`);
     } else if (range === "upcoming") {
-      where.push(`s.date > CURRENT_DATE`);
+      where.push(`s.date > ${SQL_TODAY_IST}`);
     } else if (range === "past") {
-      where.push(`s.date < CURRENT_DATE`);
+      where.push(`s.date < ${SQL_TODAY_IST}`);
     }
 
     // A doctor can ONLY see their own appointments.
@@ -1681,30 +1801,50 @@ app.post(
       });
     }
 
+    if (!/^\d+$/.test(String(id))) {
+      return res.status(400).json({ error: "Invalid appointment id" });
+    }
+
+    // BUG FIX: any status could be overwritten with any other one — e.g. an
+    // "attended" visit could be flipped to "no_show" by a stray click (and the
+    // patient then got a "you missed your appointment" WhatsApp). Only the
+    // transitions the UI actually offers are allowed now.
+    const ALLOWED_FROM = {
+      arrived: ["booked"],
+      no_show: ["booked", "arrived"],
+      attended: ["arrived", "booked"],
+    };
+
     try {
-      if (req.staff.role === "doctor") {
-        const ownership = await pool.query(
-          `SELECT 1 FROM appointments WHERE id = $1 AND doctor_id = $2`,
-          [id, req.staff.doctor_id]
-        );
-        if (ownership.rows.length === 0) {
-          return res.status(403).json({ error: "This appointment does not belong to your patients" });
-        }
+      const current = await pool.query(
+        `SELECT status, doctor_id FROM appointments WHERE id = $1`,
+        [id]
+      );
+      if (current.rows.length === 0) {
+        return res.status(404).json({ error: "Appointment not found" });
+      }
+
+      if (req.staff.role === "doctor" && Number(current.rows[0].doctor_id) !== Number(req.staff.doctor_id)) {
+        return res.status(403).json({ error: "This appointment does not belong to your patients" });
+      }
+
+      if (current.rows[0].status === status) {
+        return res.json({ success: true, appointment: { id: Number(id), status }, unchanged: true });
       }
 
       const result = await pool.query(
         `
         UPDATE appointments
         SET status = $1
-        WHERE id = $2
+        WHERE id = $2 AND status = ANY($3::text[])
         RETURNING *
         `,
-        [status, id]
+        [status, id, ALLOWED_FROM[status]]
       );
 
       if (result.rows.length === 0) {
-        return res.status(404).json({
-          error: "Appointment not found",
+        return res.status(409).json({
+          error: `Cannot change status from "${current.rows[0].status}" to "${status}".`,
         });
       }
 
@@ -1853,11 +1993,13 @@ app.post("/manual-appointments", requireAuth(["reception", "admin"]), async (req
     await client.query("COMMIT");
 
     const slot = slotCheck.rows[0];
-    sendWhatsAppMessage(
-      cleanPhone,
-      "appointment_confirmation",
-      [slot.doctor_name, String(slot.date), cleanName, String(slot.time)]
-    ).catch((e) => console.error("Manual booking WhatsApp failed:", e));
+    sendBookingConfirmation({
+      phone: cleanPhone,
+      patientName: cleanName,
+      doctorName: slot.doctor_name,
+      date: slot.date,
+      time: slot.time,
+    });
 
     res.json({
       success: true,
@@ -1867,7 +2009,7 @@ app.post("/manual-appointments", requireAuth(["reception", "admin"]), async (req
       slot: { id: slot.id, date: slot.date, time: slot.time },
     });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(() => {});
     console.error("Manual appointment error:", err);
     res.status(500).json({ error: "Failed to create manual appointment" });
   } finally {
@@ -2001,7 +2143,7 @@ app.get("/stats/summary", requireAuth(["doctor", "reception", "admin"]), async (
         SELECT COUNT(*)::int AS count
         FROM appointments a
         JOIN slots s ON a.slot_id = s.id
-        WHERE s.date = CURRENT_DATE
+        WHERE s.date = ${SQL_TODAY_IST}
           AND a.status IN ('booked', 'arrived')
         ${isDoctorScoped ? "AND a.doctor_id = $1" : ""}
       `,
@@ -2009,7 +2151,7 @@ app.get("/stats/summary", requireAuth(["doctor", "reception", "admin"]), async (
       ),
       // "Active doctors" stays hospital-wide even for a doctor's own view —
       // it's a hospital stat, not a per-doctor one.
-      pool.query(`SELECT COUNT(*)::int AS count FROM doctors WHERE active = true`),
+      pool.query(`SELECT COUNT(*)::int AS count FROM doctors WHERE active = true AND deleted_at IS NULL`),
       pool.query(
         `
         SELECT COALESCE(AVG(f.rating), 0)::float AS avg
@@ -2029,7 +2171,9 @@ app.get("/stats/summary", requireAuth(["doctor", "reception", "admin"]), async (
       ),
     ]);
 
-    const statusCounts = { booked: 0, attended: 0, no_show: 0 };
+    // BUG FIX: "arrived" was missing here, so every patient waiting at
+    // reception silently dropped out of total_appointments.
+    const statusCounts = { booked: 0, arrived: 0, attended: 0, no_show: 0 };
     statuses.rows.forEach((row) => {
       statusCounts[row.status] = row.count;
     });
@@ -2039,7 +2183,7 @@ app.get("/stats/summary", requireAuth(["doctor", "reception", "admin"]), async (
       active_doctors: doctors.rows[0].count,
       avg_rating: Math.round(rating.rows[0].avg * 10) / 10,
       ...statusCounts,
-      total_appointments: statusCounts.booked + statusCounts.attended + statusCounts.no_show,
+      total_appointments: Object.values(statusCounts).reduce((a, b) => a + b, 0),
     });
   } catch (err) {
     console.error("Stats error:", err);
@@ -2051,31 +2195,78 @@ app.get("/stats/summary", requireAuth(["doctor", "reception", "admin"]), async (
 // Natural-language time helper for conversational slot selection.
 // Examples: "2:30", "2.30 pm", "14:30", "2 30 baje".
 // =========================================================
+// BUG FIXES:
+//  - It only ever looked at the FIRST number in the message, then checked
+//    "does anything here look like a time" separately. So "meri age 45 hai,
+//    3 baje aaunga" parsed 45 -> rejected -> null (the 3 baje was ignored),
+//    and "2 log hain, 11:30 baje" became 2 PM.
+//  - "subah 7 baje" / "7 baje morning" was forced to 7 PM by the 1-7 => PM rule.
+// Now we scan every time-looking token and honour morning/evening words.
 function parseRequestedTime(text) {
   const value = String(text || "").toLowerCase();
-  const match = value.match(/\b(\d{1,2})(?:\s*[:.]\s*(\d{2})|\s+(\d{2}))?\s*(am|pm)?\b/);
-  if (!match) return null;
+  const isMorning = /\b(?:subah|subha|savere|sawere|morning)\b|सुबह/.test(value);
+  const isEvening = /\b(?:shaam|sham|evening|raat|night|dopahar|dopeher|afternoon)\b|शाम|दोपहर|रात/.test(value);
 
-  let hour = Number(match[1]);
-  const minute = Number(match[2] ?? match[3] ?? 0);
-  const meridiem = match[4];
+  const patterns = [
+    // 2:30, 2.30, 14:30, optional am/pm
+    /\b(\d{1,2})\s*[:.]\s*(\d{2})\s*(am|pm|a\.m\.|p\.m\.)?(?![\d])/g,
+    // 2 30 baje / 2 30 pm
+    /\b(\d{1,2})\s+(\d{2})\s*(am|pm|baje)\b/g,
+    // 3 pm / 3pm / 3 baje / 3 o'clock
+    /\b(\d{1,2})\s*(am|pm|a\.m\.|p\.m\.|baje|bje|o'?clock)(?![a-z])/g,
+    // Devanagari "3 बजे"
+    /(?:^|[^\d])(\d{1,2})\s*बजे/g,
+  ];
 
-  if (minute > 59) return null;
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
-  // No am/pm given (e.g. "3 baje", "3:30 ho jaye") — patients almost never
-  // mean the middle of the night when booking a hospital visit, so treat an
-  // ambiguous 1-7 as afternoon/evening (PM). Without this, "3:30" parsed as
-  // literal 03:30 was always earlier than every real (afternoon) slot, so
-  // the "nearest slot at/after requested time" logic kept matching the
-  // doctor's very FIRST slot no matter what time the patient actually asked
-  // for — e.g. asking for 3:30 PM kept proposing 2:30 PM instead.
-  if (!meridiem && hour >= 1 && hour <= 7) hour += 12;
-  if (hour > 23) return null;
+  for (const re of patterns) {
+    for (const m of value.matchAll(re)) {
+      let hour = Number(m[1]);
+      let minute = 0;
+      let meridiem = null;
+      if (re === patterns[0]) { minute = Number(m[2]); meridiem = m[3] || null; }
+      else if (re === patterns[1]) { minute = Number(m[2]); meridiem = m[3] === "baje" ? null : m[3]; }
+      else if (re === patterns[2]) { meridiem = /^(am|a\.m\.|pm|p\.m\.)$/.test(m[2]) ? m[2] : null; }
 
-  // Avoid treating ordinary numbers (patient age, appointment IDs, etc.) as time.
-  const looksLikeTime = /\d\s*(?::|\.|\s+\d{2}\b)|\b\d{1,2}\s*(am|pm)\b|\b\d{1,2}\s*baje\b|\b\d{1,2}\s*o'?clock\b/.test(value);
-  return looksLikeTime ? (hour * 60 + minute) : null;
+      if (meridiem) meridiem = meridiem.startsWith("p") ? "pm" : "am";
+      if (hour > 23 || minute > 59) continue;
+
+      if (meridiem === "pm" && hour < 12) hour += 12;
+      if (meridiem === "am" && hour === 12) hour = 0;
+      if (!meridiem && hour <= 12) {
+        if (isMorning) {
+          if (hour === 12) hour = 0;
+        } else if (isEvening) {
+          if (hour < 12) hour += 12;
+        } else if (hour >= 1 && hour <= 7) {
+          // No am/pm and no morning/evening word: patients almost never mean
+          // the middle of the night, so treat 1-7 as afternoon/evening.
+          hour += 12;
+        }
+      }
+      return hour * 60 + minute;
+    }
+  }
+  return null;
+}
+
+// "kal" / "tomorrow" / "parso" / "aaj" -> the IST date the patient means.
+// Previously ignored completely: "kal subah 10 baje" could get TODAY's
+// 10:00 slot proposed.
+function parseRequestedDay(text) {
+  const value = String(text || "").toLowerCase();
+  let offset = null;
+  if (/\b(?:parso|parson|day after tomorrow)\b|परसों/.test(value)) offset = 2;
+  // "kal se bukhar hai" = fever SINCE yesterday — not a booking day.
+  else if (/\b(?:kal|kl)\b(?!\s*(?:se|raat se|subah se|shaam se))|\b(?:tomorrow|tmrw|tmr)\b|कल(?!\s*से)/.test(value)) offset = 1;
+  else if (/\b(?:aaj|aj|today|abhi)\b|आज|अभी/.test(value)) offset = 0;
+  if (offset === null) return null;
+  return new Date(Date.now() + offset * 24 * 3600 * 1000).toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+}
+
+function preferDay(slots, day) {
+  if (!day) return slots;
+  const sameDay = slots.filter((slot) => String(slot.date).slice(0, 10) === day);
+  return sameDay.length ? sameDay : slots;
 }
 
 function slotMinutes(timeValue) {
@@ -2163,7 +2354,22 @@ app.post("/ai/chat", requireCitizen, async (req, res) => {
         error: "Please enter your full name and a valid 10-digit mobile number to confirm.",
       });
     }
+    // BUG FIX (security): the phone typed into the confirm card was trusted
+    // as-is. A logged-in patient could type SOMEONE ELSE's number and the
+    // booking would be created under that person's record — overwriting
+    // their name in the patients table. The mobile number is already
+    // verified by OTP at login, so it must match.
+    if (confirmedPhone !== normalizePhone(req.citizen.phone)) {
+      return res.status(400).json({
+        error: "Mobile number must be the same number you logged in with (OTP verified).",
+      });
+    }
+    confirmedName = confirmedName.replace(/\s+/g, " ").slice(0, 100);
   }
+
+  // Only the recent part of the conversation is needed, and the client
+  // controls this array — cap it so one request can't send a huge prompt.
+  const safeHistory = Array.isArray(history) ? history.slice(-40) : [];
 
   if (
     !confirmDetails &&
@@ -2316,6 +2522,14 @@ app.post("/ai/chat", requireCitizen, async (req, res) => {
       // below) so replies don't flip-flop between languages mid-chat.
       language:
         normalizeLanguage(booking.language) || null,
+
+      // Doctors matched from the patient's symptom on an earlier turn. Kept
+      // in the booking state so the NEXT turn ("10 baje aa sakta hoon") can
+      // still pick the earliest slot across them even if the model doesn't
+      // repeat matched_doctor_ids on that turn (it often doesn't).
+      matched_doctor_ids: Array.isArray(booking.matched_doctor_ids)
+        ? booking.matched_doctor_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0).slice(0, 50)
+        : [],
     };
 
     // Keep reception/doctor summaries strictly about the patient's medical
@@ -2551,8 +2765,8 @@ EXACT FORMAT:
 
     const conversation = [];
 
-    if (Array.isArray(history)) {
-      for (const item of history) {
+    if (safeHistory.length) {
+      for (const item of safeHistory) {
         if (
           item &&
           typeof item.message === "string"
@@ -2581,6 +2795,18 @@ EXACT FORMAT:
         },
       ],
     });
+
+    // Gemini expects the turns to start with "user" and alternate. The chat
+    // UI's history starts with the assistant's welcome message and can have
+    // two assistant bubbles in a row (e.g. after a network error), which some
+    // models reject with a 400. Drop leading model turns and merge repeats.
+    while (conversation.length > 1 && conversation[0].role === "model") conversation.shift();
+    for (let i = conversation.length - 1; i > 0; i--) {
+      if (conversation[i].role === conversation[i - 1].role) {
+        conversation[i - 1].parts[0].text += "\n" + conversation[i].parts[0].text;
+        conversation.splice(i, 1);
+      }
+    }
 
     // =====================================================
     // CONFIRM-DETAILS GATE
@@ -2647,8 +2873,18 @@ EXACT FORMAT:
       // =====================================================
 
       try {
-        aiResult =
-          JSON.parse(rawText);
+        // Models sometimes wrap JSON in ```json fences or add a stray line
+        // around it; take the outermost {...} block before parsing.
+        let jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "");
+        const firstBrace = jsonText.indexOf("{");
+        const lastBrace = jsonText.lastIndexOf("}");
+        if (firstBrace > 0 || (lastBrace !== -1 && lastBrace < jsonText.length - 1)) {
+          jsonText = jsonText.slice(firstBrace, lastBrace + 1);
+        }
+        aiResult = JSON.parse(jsonText);
+        if (!aiResult || typeof aiResult !== "object" || Array.isArray(aiResult)) {
+          throw new Error("AI response was not a JSON object");
+        }
       } catch (parseError) {
         console.error(
           "AI JSON parse error:",
@@ -2665,9 +2901,9 @@ EXACT FORMAT:
           success: true,
           booked: false,
 
-          reply:
-            rawText ||
-            await localize("parseFallback", currentBooking.language || "Hinglish"),
+          // BUG FIX: this used to send rawText itself — i.e. half-broken JSON
+          // like '{"reply": "Aap kitne' — straight into the patient's chat.
+          reply: await localize("parseFallback", currentBooking.language || "Hinglish"),
 
           booking: currentBooking,
 
@@ -2694,9 +2930,15 @@ EXACT FORMAT:
     // after the greeting, before the patient asked for anything.
     // =====================================================
 
+    const activeDoctorIds = new Set(doctors.map((d) => Number(d.id)));
     const matchedIds = Array.isArray(aiResult.matched_doctor_ids)
-      ? aiResult.matched_doctor_ids.map(Number)
+      ? aiResult.matched_doctor_ids.map(Number).filter((id) => activeDoctorIds.has(id))
       : [];
+    // Fall back to the doctors matched on an earlier turn (see
+    // currentBooking.matched_doctor_ids) when this turn returned none.
+    const rememberedMatchedIds = matchedIds.length
+      ? matchedIds
+      : currentBooking.matched_doctor_ids.filter((id) => activeDoctorIds.has(id));
 
     let showDoctorList = aiResult.show_doctor_list === true;
 
@@ -2739,9 +2981,26 @@ EXACT FORMAT:
     // Make explicit confirmations deterministic. Gemini can occasionally
     // miss a simple "yes/haan/book it" even when all booking details are
     // already present in the current booking state.
-    const confirmationText = effectiveMessage.trim().toLowerCase();
-    const explicitConfirmation =
-      /^(yes|yeah|yep|haan|ha|ji|theek hai|thik hai|book it|confirm|confirmed|please book|kar do|book kar do|haan book kar do|haan kar do|bilkul|sure|proceed)$/i.test(confirmationText);
+    // BUG FIX: the old check compared the raw text against an exact list, so
+    // "Yes!", "haan ji", "ok", "okay", "yes please", "हाँ" or "👍" never counted
+    // as a yes — and the bot kept asking the same "will you come at this
+    // slot?" question in a loop. Strip punctuation/emoji first and accept the
+    // common ways people say yes / no.
+    const confirmationText = effectiveMessage
+      .trim()
+      .toLowerCase()
+      .replace(/👍|✅|🙏|👌/g, " ok ")
+      .replace(/[^\p{L}\p{M}\p{N}\s']/gu, " ") // keep \p{M}: Hindi matras (हाँ, नहीं)
+      .replace(/\s+/g, " ")
+      .trim();
+    const YES_WORDS = "(?:yes|yess+|yeah|yea|yep|yup|y|ok|okay|okk+|k|haan|haa|han|ha|hanji|haanji|hnji|ji|ji haan|theek hai|thik hai|theek|thik|sahi hai|done|sure|bilkul|zaroor|jarur|chalega|confirm|confirmed|proceed|book it|book kar do|kar do|kardo|please book|हाँ|हां|हा|जी|जी हाँ|ठीक है|बिल्कुल)";
+    const explicitConfirmation = new RegExp(
+      `^(?:${YES_WORDS})(?: (?:${YES_WORDS}|please|pls|sir|madam|mam|ji|hai|aa jaunga|aa jaungi|aaunga|aaungi|aa sakta hoon|aa sakti hoon|chalega|book kar do|kar do|kar dijiye|thank you|thanks))*$`,
+      "i"
+    ).test(confirmationText);
+    const explicitRejection =
+      /^(?:no|nope|nah|n|nahi|nahin|nhi|na|mat karo|nahi aa paunga|nahi aa paungi|नहीं|ना)(?: .*)?$/i.test(confirmationText) &&
+      !explicitConfirmation;
 
     // The AI model itself may output a slot_id directly (per the SLOT
     // CONVERSATION rules in the system prompt) any time it thinks it has
@@ -2758,10 +3017,9 @@ EXACT FORMAT:
         currentBooking.patient_name ||
         null,
 
-      phone:
-        aiBooking.phone ||
-        currentBooking.phone ||
-        null,
+      // The patient's phone is the OTP-verified login number — never a
+      // number the AI extracted from chat text.
+      phone: normalizePhone(req.citizen.phone) || null,
 
       doctor_id:
         aiBooking.doctor_id
@@ -2807,6 +3065,8 @@ EXACT FORMAT:
              null),
     };
 
+    finalBooking.matched_doctor_ids = rememberedMatchedIds;
+
     // Hardcoded (non-AI-generated) system messages below use this so they
     // match whatever language the conversation has settled into.
     const lang = finalBooking.language || "Hinglish";
@@ -2820,6 +3080,7 @@ EXACT FORMAT:
     }
 
     const requestedMinutes = parseRequestedTime(effectiveMessage.trim());
+    const requestedDay = parseRequestedDay(effectiveMessage);
     if (medicalComplaint && requestedMinutes == null && !finalBooking.slot_id && !finalBooking.confirmed) {
       // Keep the symptom-first question in the patient's detected language.
       // English/Hindi/Hinglish use our deterministic translations; any other
@@ -2887,9 +3148,10 @@ EXACT FORMAT:
     if (requestedMinutes != null) {
       let nearest = null;
       if (finalBooking.doctor_id) {
-        nearest = pickNearestSlotAfterTime(slots, finalBooking.doctor_id, requestedMinutes);
-      } else if (matchedIds.length > 0) {
-        nearest = pickNearestSlotAfterDoctorIds(slots, matchedIds, requestedMinutes);
+        nearest = pickNearestSlotAfterTime(preferDay(slots.filter((sl) => Number(sl.doctor_id) === Number(finalBooking.doctor_id)), requestedDay), finalBooking.doctor_id, requestedMinutes);
+      } else if (rememberedMatchedIds.length > 0) {
+        const idSet = new Set(rememberedMatchedIds.map(Number));
+        nearest = pickNearestSlotAfterDoctorIds(preferDay(slots.filter((sl) => idSet.has(Number(sl.doctor_id))), requestedDay), rememberedMatchedIds, requestedMinutes);
         if (nearest) finalBooking.doctor_id = Number(nearest.doctor_id);
       }
       if (nearest) {
@@ -2918,7 +3180,7 @@ EXACT FORMAT:
           Hinglish: "Great — booking finish karne ke liye niche apna naam aur mobile number confirm kar dijiye.",
         };
         aiResult.reply = await localizeTemplate(confirmedSlotTemplates, lang);
-      } else if (/^(no|nahi|nahin|na|nope)$/i.test(confirmationText)) {
+      } else if (explicitRejection) {
         finalBooking.pending_slot_id = null;
         aiResult.reply = await localize("arrivalTimeQuestion", lang);
       }
@@ -2944,11 +3206,22 @@ EXACT FORMAT:
       const proposedSlot = slots.find((slot) => Number(slot.id) === Number(finalBooking.pending_slot_id));
       if (proposedSlot) {
         const proposedDoctor = doctors.find((doctor) => Number(doctor.id) === Number(proposedSlot.doctor_id));
+        // BUG FIX: only the time was mentioned. When today's slots were over,
+        // pickNearestSlotAfterTime() falls through to a FUTURE day, but the
+        // patient was just told "available at 10:00 AM" and assumed today.
+        const todayIst = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+        const tomorrowIst = new Date(Date.now() + 24 * 3600 * 1000).toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+        const slotDate = String(proposedSlot.date).slice(0, 10);
+        const dayWord = {
+          English: slotDate === todayIst ? "today" : slotDate === tomorrowIst ? "tomorrow" : `on ${formatHumanDate(slotDate)}`,
+          Hindi: slotDate === todayIst ? "आज" : slotDate === tomorrowIst ? "कल" : formatHumanDate(slotDate) + " को",
+          Hinglish: slotDate === todayIst ? "aaj" : slotDate === tomorrowIst ? "kal" : formatHumanDate(slotDate) + " ko",
+        };
         const timeText = formatChatTime(proposedSlot.time);
         const slotQuestionTemplates = {
-          English: `${proposedDoctor?.name ? `${proposedDoctor.name} is` : "The nearest doctor is"} available at ${timeText}. Will you come at this slot?`,
-          Hindi: `${proposedDoctor?.name || "डॉक्टर"} ${timeText} पर उपलब्ध हैं। क्या आप इस समय आ सकते हैं?`,
-          Hinglish: `${proposedDoctor?.name || "Doctor"} ${timeText} par available hain. Kya aap is slot par aa sakte hain?`,
+          English: `${proposedDoctor?.name ? `${proposedDoctor.name} is` : "The nearest doctor is"} available ${dayWord.English} at ${timeText}. Will you come at this slot?`,
+          Hindi: `${proposedDoctor?.name || "डॉक्टर"} ${dayWord.Hindi} ${timeText} पर उपलब्ध हैं। क्या आप इस समय आ सकते हैं?`,
+          Hinglish: `${proposedDoctor?.name || "Doctor"} ${dayWord.Hinglish} ${timeText} par available hain. Kya aap is slot par aa sakte hain?`,
         };
         aiResult.reply = await localizeTemplate(slotQuestionTemplates, lang);
       }
@@ -3042,8 +3315,8 @@ EXACT FORMAT:
     // can open a booked appointment and see exactly what the patient
     // typed to the chatbot — not just the one-line chat_summary.
     const chatTranscript = [
-      ...(Array.isArray(history)
-        ? history
+      ...(safeHistory.length
+        ? safeHistory
             .filter((x) => x && typeof x.message === "string")
             .map((x) => ({
               role: x.role === "assistant" ? "assistant" : "user",
@@ -3248,47 +3521,38 @@ EXACT FORMAT:
         // WHATSAPP
         // -------------------------------------------------
 
-        // Dr name, date, patient name, time — in that order, matching the
-        // confirmation template's variable slots.
-        sendWhatsAppMessage(
-          finalBooking.phone,
-          "appointment_confirmation",
-          [
-            slot.doctor_name,
-            String(slot.date),
-            finalBooking.patient_name,
-            String(slot.time),
-          ]
-        ).catch((e) => {
-          console.error(
-            "WhatsApp confirmation failed:",
-            e
-          );
+        sendBookingConfirmation({
+          phone: finalBooking.phone,
+          patientName: finalBooking.patient_name,
+          doctorName: slot.doctor_name,
+          date: slot.date,
+          time: slot.time,
         });
 
         // -------------------------------------------------
         // SUCCESS
         // -------------------------------------------------
 
+        // Human-readable date/time (was raw "2026-09-04" / "14:30:00").
         const successTemplates = {
           English:
             `Your appointment is confirmed ✅\n` +
             `Doctor: ${slot.doctor_name}\n` +
-            `Date: ${String(slot.date)}\n` +
+            `Date: ${formatHumanDate(slot.date)}\n` +
             `Patient: ${finalBooking.patient_name}\n` +
-            `Time: ${String(slot.time)}`,
+            `Time: ${formatChatTime(slot.time)}`,
           Hindi:
             `आपकी अपॉइंटमेंट कन्फर्म हो गई है ✅\n` +
             `डॉक्टर: ${slot.doctor_name}\n` +
-            `तारीख: ${String(slot.date)}\n` +
+            `तारीख: ${formatHumanDate(slot.date)}\n` +
             `मरीज़: ${finalBooking.patient_name}\n` +
-            `समय: ${String(slot.time)}`,
+            `समय: ${formatChatTime(slot.time)}`,
           Hinglish:
             `Aapki appointment confirm ho gayi hai ✅\n` +
             `Doctor: ${slot.doctor_name}\n` +
-            `Date: ${String(slot.date)}\n` +
+            `Date: ${formatHumanDate(slot.date)}\n` +
             `Patient: ${finalBooking.patient_name}\n` +
-            `Time: ${String(slot.time)}`,
+            `Time: ${formatChatTime(slot.time)}`,
         };
         const successReply = await localizeTemplate(successTemplates, lang);
 
@@ -3341,9 +3605,7 @@ EXACT FORMAT:
           integration_payload: integrationPayload,
         });
       } catch (bookingError) {
-        await client.query(
-          "ROLLBACK"
-        );
+        await client.query("ROLLBACK").catch(() => {});
 
         console.error(
           "AI booking error:",
@@ -3351,10 +3613,9 @@ EXACT FORMAT:
         );
 
         return res.status(500).json({
+          // Internal error text (SQL etc.) is logged above, not sent to patients.
           error:
             "AI booking failed",
-          details:
-            bookingError.message,
         });
       } finally {
         client.release();
@@ -3368,7 +3629,12 @@ EXACT FORMAT:
     let conversationalReply = aiResult.reply || (await localize("genericHelp", lang));
 
     const doctorWasJustSelected = !currentBooking.doctor_id && finalBooking.doctor_id;
-    if (doctorWasJustSelected && !finalBooking.slot_id) {
+    // BUG FIX: when the doctor got picked on the same turn a slot was
+    // proposed (symptom -> "10 baje aaunga"), this block overwrote the
+    // "Dr X is available tomorrow at 10:00 AM — will you come?" question
+    // with "what time can you come?", so the patient's next "yes" confirmed
+    // a slot they had never been shown.
+    if (doctorWasJustSelected && !finalBooking.slot_id && !finalBooking.pending_slot_id) {
       const doctorSlots = slots
         .filter((slot) => Number(slot.doctor_id) === Number(finalBooking.doctor_id))
         .sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.time).localeCompare(String(b.time)));
@@ -3441,9 +3707,6 @@ EXACT FORMAT:
     return res.status(500).json({
       error:
         "AI assistant failed",
-
-      details:
-        err.message,
     });
   }
 });
@@ -3460,11 +3723,23 @@ EXACT FORMAT:
 // (defaults to 60 = "remind about an hour before"). The loop itself runs
 // every REMINDER_POLL_MINUTES (default 5) and picks up any booked
 // appointment that has now entered the lead window.
-const REMINDER_LEAD_MINUTES = Number(process.env.REMINDER_LEAD_MINUTES) || 60;
-const REMINDER_POLL_MINUTES = Number(process.env.REMINDER_POLL_MINUTES) || 5;
+const REMINDER_LEAD_MINUTES = Math.max(1, Math.round(Number(process.env.REMINDER_LEAD_MINUTES) || 60));
+const REMINDER_POLL_MINUTES = Math.max(1, Number(process.env.REMINDER_POLL_MINUTES) || 5);
+let reminderJobRunning = false;
 
 async function sendDueReminders() {
+  // Nothing to send until a real WhatsApp provider is configured — don't
+  // burn through (and permanently mark as "sent") every reminder meanwhile.
+  if (!isWhatsAppConfigured) return;
+  if (reminderJobRunning) return; // previous run still going
+  reminderJobRunning = true;
+
   try {
+    // BUG FIX: slot date+time is IST wall-clock, but it was compared with
+    // NOW() — which the database evaluates in UTC on Neon. A 10:00 AM IST
+    // appointment was treated as 10:00 UTC (= 3:30 PM IST), so the "1 hour
+    // before" reminder went out ~4.5 hours AFTER the visit. Compare against
+    // IST wall-clock time instead.
     const due = await pool.query(
       `
       SELECT a.id, p.name AS patient_name, p.phone, d.name AS doctor_name, s.date, s.time
@@ -3475,34 +3750,45 @@ async function sendDueReminders() {
       WHERE a.status = 'booked'
         AND d.deleted_at IS NULL
         AND a.reminder_sent IS NOT TRUE
-        AND (s.date + s.time) > NOW()
-        AND (s.date + s.time) <= NOW() + ($1 || ' minutes')::interval
+        AND (s.date + s.time) > ${SQL_NOW_IST}
+        AND (s.date + s.time) <= ${SQL_NOW_IST} + make_interval(mins => $1::int)
       `,
       [REMINDER_LEAD_MINUTES]
     );
 
+    let sent = 0;
     for (const row of due.rows) {
+      // Claim the reminder FIRST (atomically), then send. Previously it was
+      // send-then-mark, so two overlapping runs (or two server instances)
+      // could both send the same reminder.
+      const claim = await pool.query(
+        "UPDATE appointments SET reminder_sent = true WHERE id = $1 AND reminder_sent IS NOT TRUE RETURNING id",
+        [row.id]
+      );
+      if (!claim.rows.length) continue;
       try {
+        // Marked sent regardless of delivery success so a hard failure (bad
+        // number, template not approved yet) can't retry-loop forever; real
+        // send failures are still visible in the whatsapp.js logs.
         await sendWhatsAppMessage(row.phone, "appointment_reminder", [
           row.patient_name,
           row.doctor_name,
-          String(row.date),
-          String(row.time),
+          formatHumanDate(row.date),
+          formatChatTime(row.time),
         ]);
+        sent++;
       } catch (e) {
         console.error("Reminder WhatsApp failed:", e);
       }
-      // Mark sent regardless of delivery success so a hard failure (bad
-      // number, template not approved yet) can't retry-loop forever; real
-      // send failures are still visible in the whatsapp.js logs above.
-      await pool.query("UPDATE appointments SET reminder_sent = true WHERE id = $1", [row.id]);
     }
 
-    if (due.rows.length) {
-      console.log(`[reminders] Sent ${due.rows.length} appointment reminder(s)`);
+    if (sent) {
+      console.log(`[reminders] Sent ${sent} appointment reminder(s)`);
     }
   } catch (err) {
     console.error("Reminder job failed:", err);
+  } finally {
+    reminderJobRunning = false;
   }
 }
 
@@ -3534,7 +3820,11 @@ async function initializeDatabase() {
     WHERE d.deleted_at IS NULL
       AND NOT EXISTS (
         SELECT 1 FROM staff s WHERE s.doctor_id = d.id AND s.role = 'doctor'
-      );
+      )
+    -- BUG FIX: if admin had already given some other doctor the username
+    -- "dr<id>", this insert hit a unique violation and the server refused
+    -- to start at all (process.exit(1)).
+    ON CONFLICT (username) DO NOTHING;
   `, [demoHash]);
 
   console.log("Database schema/migrations ready");

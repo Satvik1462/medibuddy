@@ -1,18 +1,35 @@
 export const API_URL =
   import.meta.env.VITE_API_URL || "http://localhost:3000";
 
+// These helpers are only used by the STAFF console. (The patient chat has
+// its own fetch calls with the citizen token.)
+//
+// BUG FIX: this used to fall back to the citizen token, so a staff page opened
+// in a browser where a patient was also logged in sent the WRONG token, got a
+// 403, and the staff member was silently logged out.
 function authHeaders() {
-  const token = localStorage.getItem("staff_token") || localStorage.getItem("citizen_token");
+  const token = localStorage.getItem("staff_token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
+
+const DEACTIVATED_TEXT = "deactivated";
 
 async function handle(response) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
+    // BUG FIX: ANY 403 used to log the user out — including ordinary
+    // "not allowed" answers like "This appointment does not belong to your
+    // patients". Only a dead session (401) or a deactivated account ends
+    // the session now.
+    const sessionDead =
+      response.status === 401 ||
+      (response.status === 403 && String(data.error || "").toLowerCase().includes(DEACTIVATED_TEXT));
+    if (sessionDead) {
       localStorage.removeItem("staff_token");
       localStorage.removeItem("staff_info");
-      window.location.href = "/login";
+      if (!window.location.pathname.startsWith("/login")) {
+        window.location.href = "/login";
+      }
     }
     throw new Error(data.error || `Request failed (${response.status})`);
   }

@@ -2,7 +2,8 @@
 
 ## Run locally
 
-Open two terminals from `hospital-system`:
+Copy `backend/.env.example` to `backend/.env` and fill it in (at least `DATABASE_URL`,
+`JWT_SECRET`, `GEMINI_API_KEY`). Then open two terminals from the project folder:
 
 ### Backend
 ```powershell
@@ -79,9 +80,13 @@ WhatsApp Business account is connected yet. To switch it on:
 2. **Get your WhatsApp Business number verified** with that provider (they'll walk you
    through Meta's business verification).
 3. **Create and get approval for a message template** named exactly `appointment_confirmation`
-   with 3 body variables, in this order: `{{1}}` patient name, `{{2}}` date, `{{3}}` time.
+   with 4 body variables, in this order: `{{1}}` patient name, `{{2}}` doctor name,
+   `{{3}}` date (e.g. "4 Sep 2026"), `{{4}}` time (e.g. "2:30 PM") — the same order as the
+   reminder template below.
    Template approval is done by Meta/the provider and can take a few hours to a couple of days.
-4. **Fill in the real values** in `backend/.env`:
+4. **Fill in the real values** in `backend/.env` (copy `backend/.env.example` first). The
+   `Authorization` header is sent as `Basic <key>` for Interakt automatically; set
+   `WHATSAPP_AUTH_SCHEME=Bearer` for providers that need Bearer:
    ```
    WHATSAPP_API_KEY=<your real API key>
    WHATSAPP_API_URL=https://api.interakt.ai/v1/public/message/
@@ -136,6 +141,10 @@ The staff sidebar now has three working sections instead of one:
 The doctor-schedule calendar also got a few usability upgrades: **Today/Tomorrow** quick-jump
 buttons, doctors sorted alphabetically with their slots sorted by time, a booked-load bar per
 doctor, and a small legend for the Available/Booked colours.
+
+## Bug fixes
+
+See `BUGFIXES.md` for the list of bugs found and fixed in this version.
 
 ## Database note
 The backend automatically runs `database/schema.sql` on startup. This includes the

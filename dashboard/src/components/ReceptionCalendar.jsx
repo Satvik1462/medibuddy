@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { getJSON, formatTime, todayISO, tomorrowISO } from "../lib/api";
 import { FilterIcon } from "./icons";
 
@@ -6,13 +6,18 @@ export default function ReceptionCalendar({ date, setDate, search, setSearch, re
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const hasDataRef = useRef(false);
 
+  // BUG FIX: the 15-second auto refresh flipped `loading` every time, so the
+  // whole calendar blinked to "Loading calendar…" four times a minute. Only
+  // show the loader when there is nothing on screen yet.
   const load = useCallback(async () => {
     if (!date) return;
-    setLoading(true);
+    if (!hasDataRef.current) setLoading(true);
     try {
       const data = await getJSON(`/reception/calendar?date=${encodeURIComponent(date)}&search=${encodeURIComponent(search)}`);
       setRows(data);
+      hasDataRef.current = true;
       setError("");
     } catch (err) {
       setError(err.message || "Could not load calendar");
